@@ -3,7 +3,7 @@
 // MemCache.pas - Delphi client for Memcached
 //
 // Project Homepage:
-//    http://code.google.com/p/DelphiMemcache
+//    http://code.google.com/p/delphimemcache
 //
 // Memcached can be found at:
 //    http://code.google.com/p/memcached
@@ -255,7 +255,7 @@ begin
     sValue+#13#10
   );
   if s <> 'STORED' then
-    raise EMemCacheException.Create('Error storing value:'+s);
+    raise EMemCacheException.Create('Error storing value: '+s);
 end;
 
 procedure TMemCache.Append(Key, Value: string; Expires: TDateTime = 0; Flags: Word = 0);
@@ -268,7 +268,7 @@ begin
     Value+#13#10
   );
   if s <> 'STORED' then
-    raise EMemCacheException.Create('Error storing value:'+s);
+    raise EMemCacheException.Create('Error storing value: '+s);
 end;
 
 constructor TMemCache.Create(ConfigData: TStrings);
@@ -341,7 +341,10 @@ begin
     repeat
       s := tcp.Socket.ReadLn;
       s13 := Copy(s,1,13);
-      Result := Result+#13#10+s;
+      if result <> '' then
+        Result := Result+#13#10+s
+      else
+        Result := s;
 
     until bIncDec or
           (s = 'END') or
@@ -353,9 +356,6 @@ begin
   finally
     tcp.Free;
   end;
-
-  if result <> '' then
-    System.Delete(result,1,2);
 
   if Result <> 'ERROR'#13#10 then
   begin
@@ -392,7 +392,7 @@ begin
     sValue+#13#10
   );
   if s <> 'STORED' then
-    raise EMemCacheException.Create('Error storing value:'+s);
+    raise EMemCacheException.Create('Error storing value: '+s);
 end;
 
 procedure TMemCache.Insert(Key, Value: string; Expires: TDateTime = 0; Flags: Word = 0);
@@ -405,7 +405,7 @@ begin
     Value+#13#10
   );
   if s <> 'STORED' then
-    raise EMemCacheException.Create('Error storing value:'+s);
+    raise EMemCacheException.Create('Error storing value: '+s);
 end;
 
 function TMemCache.LocateServer(key : string): TServerRingItem;
@@ -456,7 +456,7 @@ begin
     sValue+#13#10
   );
   if s <> 'STORED' then
-    raise EMemCacheException.Create('Error storing value:'+s);
+    raise EMemCacheException.Create('Error storing value: '+s);
 end;
 
 procedure TMemCache.Prepend(Key, Value: string; Expires: TDateTime = 0;
@@ -470,7 +470,7 @@ begin
     Value+#13#10
   );
   if s <> 'STORED' then
-    raise EMemCacheException.Create('Error storing value:'+s);
+    raise EMemCacheException.Create('Error storing value: '+s);
 end;
 
 procedure TMemCache.Replace(Key, Value: string; Expires: TDateTime = 0;
@@ -484,7 +484,7 @@ begin
     Value+#13#10
   );
   if s <> 'STORED' then
-    raise EMemCacheException.Create('Error storing value:'+s);
+    raise EMemCacheException.Create('Error storing value: '+s);
 end;
 
 procedure TMemCache.RegisterServer(str: string);
@@ -538,7 +538,7 @@ begin
     sValue+#13#10
   );
   if s <> 'STORED' then
-    raise EMemCacheException.Create('Error storing value:'+s);
+    raise EMemCacheException.Create('Error storing value: '+s);
 end;
 
 procedure TMemCache.Store(Key, Value: string; Expires: TDateTime = 0; Flags: Word = 0);
@@ -551,7 +551,7 @@ begin
     Value+#13#10
   );
   if s <> 'STORED' then
-    raise EMemCacheException.Create('Error storing value:'+s);
+    raise EMemCacheException.Create('Error storing value: '+s);
 end;
 
 procedure TMemCache.SortServerRing;
@@ -596,7 +596,7 @@ begin
     sValue+#13#10
   );
   if s <> 'STORED' then
-    raise EMemCacheException.Create('Error storing value:'+s);
+    raise EMemCacheException.Create('Error storing value: '+s);
 end;
 
 procedure TMemCache.StoreSafely(Key, Value: string; SafeToken: UInt64;
@@ -610,7 +610,7 @@ begin
     Value+#13#10
   );
   if s <> 'STORED' then
-    raise EMemCacheException.Create('Error storing value:'+s);
+    raise EMemCacheException.Create('Error storing value: '+s);
 end;
 
 procedure TMemCache.StoreSafely(Key: string; Value: TStream; SafeToken: UInt64;
@@ -627,7 +627,7 @@ begin
     sValue+#13#10
   );
   if s <> 'STORED' then
-    raise EMemCacheException.Create('Error storing value:'+s);
+    raise EMemCacheException.Create('Error storing value: '+s);
 end;
 
 function TMemCache.ToHash(str: string): UInt64;
@@ -696,18 +696,28 @@ var
 begin
   inherited Create;
   FStream := TStringStream.Create;
-  FCommand := NextField(text);
-  FKey := NextField(text);
-  FFlags := StrToInt(NextField(text));
-  iSize := StrToInt(NextField(text));
-  s := NextField(text);
-  if s <> '' then
-    FSafeToken := StrToUInt64(s)
-  else
+  if text='END' then
+  begin
+    FCommand := text;
+    FKey := '';
+    FFlags := 0;
     FSafeToken := 0;
-  Delete(text,1,2);
-  FStream.WriteString(Copy(text,1,iSize));
-  FStream.Position := 0;
+    FStream.Size := 0;
+  end else
+  begin
+    FCommand := NextField(text);
+    FKey := NextField(text);
+    FFlags := StrToInt(NextField(text));
+    iSize := StrToInt(NextField(text));
+    s := NextField(text);
+    if s <> '' then
+      FSafeToken := StrToUInt64(s)
+    else
+      FSafeToken := 0;
+    Delete(text,1,2);
+    FStream.WriteString(Copy(text,1,iSize));
+    FStream.Position := 0;
+  end;
 end;
 
 destructor TMemCacheValue.Destroy;
