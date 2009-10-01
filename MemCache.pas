@@ -2,7 +2,7 @@
 //
 // MemCache.pas - Delphi client for Memcached
 //
-// Delphi Client Version 0.0.1
+// Delphi Client Version 0.0.2
 // Supporting Memcached Version 1.2.6
 //
 // Project Homepage:
