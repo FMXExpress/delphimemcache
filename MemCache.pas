@@ -12,6 +12,9 @@
 //    http://code.google.com/p/memcached
 //    http://danga.com/memcached
 //
+// Protocol description:
+//    http://code.sixapart.com/svn/memcached/trunk/server/doc/protocol.txt
+//
 // New BSD License
 //    Copyright (c) 2009, by Sivv LLC
 //    All rights reserved.
@@ -105,6 +108,10 @@
 //           on a value in the memcache.  There must be a value alraedy stored for the
 //           specified key
 //
+//  TODO:
+//    - Refactor to move to a connected object pool for each server and utilize
+//      the preconnected objects. Should make for a rather large performance boost.
+//
 ////////////////////////////////////////////////////////////////////////////////////
 
 unit MemCache;
@@ -182,11 +189,12 @@ type
     ServerRing : array of TServerRingItem;
     FRegisterPosition : integer;
   protected
-    function ToHash(str : string) : UInt64;
-    function ExecuteCommand(key, cmd : string) : string;
-    function LocateServer(key : string) : TServerRingItem;
-    procedure RegisterServer(str : string);
-    procedure SortServerRing;
+    function ToHash(str : string) : UInt64; virtual;
+    function ExecuteCommand(key, cmd : string) : string; virtual;
+    function LocateServer(key : string) : TServerRingItem; overload; virtual;
+    function LocateServer(RingPosition : Int64): TServerRingItem; overload; virtual;
+    procedure RegisterServer(str : string); virtual;
+    procedure SortServerRing; virtual;
   public
     //
     // ConfigData is a string list of %%=ip:port where %% is the percentage of distribution.
@@ -214,12 +222,20 @@ type
     function Delete(Key : string; BlockSeconds : Integer = 0) : boolean;
     function Increment(Key : string; ByValue : integer = 1) : UInt64;
     function Decrement(Key : string; ByValue : integer = 1) : UInt64;
+
+    function CheckServers(RaiseException : boolean = false) : boolean;
   end;
 
+  function MemcacheConfigFormat(Load : integer; IP : string; Port : integer = 11211) : string;
 
 implementation
 
 uses DateUtils;
+
+function MemcacheConfigFormat(Load : integer; IP : string; Port : integer = 11211) : string;
+begin
+  Result := IntToStr(Load)+'='+IP+':'+IntToStr(Port)
+end;
 
 function StrToUInt64(const S: string): UInt64;
 var
@@ -326,18 +342,30 @@ function TMemCache.ExecuteCommand(key, cmd: string): string;
 var
   tcp : TIdTCPClient;
   server : TServerRingItem;
-  s, s13 : string;
+  s, s13, sFirstFound : string;
   bIncDec : boolean;
 begin
   s := Copy(cmd,1,4);
   bIncDec := (s = 'incr') or (s = 'decr');
-  // TODO: Possibly move to object pool.
+  // TODO: Refactor to move to a connected object pool for each server and utilize the preconnected objects.
+  //       Will make for a rather large performance boost.
   tcp := TIdTCPClient.Create;
   try
-    server := LocateServer(key);
-    tcp.Host := server.IP;
-    tcp.Port := server.Port;
-    tcp.Connect;
+    sFirstFound := '';
+    repeat
+      server := LocateServer(key);
+      tcp.Host := server.IP;
+      tcp.Port := server.Port;
+      try
+        tcp.Connect;
+      except
+        if server.IP = sFirstFound then
+          raise EMemCacheException.Create('None of the registered MemCached servers are responding.');
+      end;
+      if sFirstFound = '' then
+        sFirstFound := server.IP;
+    until tcp.Connected;
+
     tcp.Socket.Write(cmd+#13#10);
     result := '';
     s := '';
@@ -412,15 +440,18 @@ begin
 end;
 
 function TMemCache.LocateServer(key : string): TServerRingItem;
+begin
+  Result := LocateServer(ToHash(key));
+end;
+
+function TMemCache.LocateServer(RingPosition : Int64): TServerRingItem;
 var
-  iKey : UInt64;
   i, iFound : integer;
 begin
-  iKey := ToHash(key);
   iFound := -1;
   for i := Low(ServerRing) to High(ServerRing) do
   begin
-    if ServerRing[i].Pos > iKey then
+    if ServerRing[i].Pos > RingPosition then
     begin
       if i =low(ServerRing) then
         iFound := High(ServerRing)
@@ -631,6 +662,37 @@ begin
   );
   if s <> 'STORED' then
     raise EMemCacheException.Create('Error storing value: '+s);
+end;
+
+function TMemCache.CheckServers(RaiseException : boolean = false) : boolean;
+var
+  i : integer;
+  tcp : TIdTCPClient;
+begin
+  Result := True;
+  tcp := TIdTCPClient.Create;
+  try
+    for i := Low(ServerList) to High(ServerList) do
+    begin
+      tcp.Host := ServerList[i].IP;
+      tcp.Port := ServerList[i].Port;
+      try
+        tcp.Connect;
+      except
+        on e: exception do
+        begin
+          if not raiseException then
+          begin
+            Result := False;
+            exit;
+          end else
+            raise Exception(e.ClassType).Create('Error connecting with memcache on "'+ServerList[i].IP+':'+IntToStr(ServerList[i].Port)+'". '+e.Message);
+        end;
+      end;
+    end;
+  finally
+    tcp.Free;
+  end;
 end;
 
 function TMemCache.ToHash(str: string): UInt64;
