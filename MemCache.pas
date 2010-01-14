@@ -45,6 +45,11 @@
 //    SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 //
 //  Changelog -
+//    1/14/2010 - Fixed bug in failover code when a server stops responding.
+//                Impelemented a minor performance improvement by reducing waste in ServerRing
+//                Added a connect timeout property to speed failover response. - defaulted the
+//                value to 2s as it is assumed that the cache servers will be on a local
+//                network and connections should be established quickly.
 //    9/30/2009 - Initial release
 //
 //  Use:
@@ -188,11 +193,12 @@ type
     ServerList : array of TMemCacheServer;
     ServerRing : array of TServerRingItem;
     FRegisterPosition : integer;
+    FConnectTimeout: integer;
   protected
     function ToHash(str : string) : UInt64; virtual;
     function ExecuteCommand(key, cmd : string) : string; virtual;
-    function LocateServer(key : string) : TServerRingItem; overload; virtual;
-    function LocateServer(RingPosition : Int64): TServerRingItem; overload; virtual;
+    function LocateServer(key : string; Failures : array of TServerRingItem) : TServerRingItem; overload; virtual;
+    function LocateServer(RingPosition : Int64; Failures : array of TServerRingItem): TServerRingItem; overload; virtual;
     procedure RegisterServer(str : string); virtual;
     procedure SortServerRing; virtual;
   public
@@ -224,6 +230,7 @@ type
     function Decrement(Key : string; ByValue : integer = 1) : UInt64;
 
     function CheckServers(RaiseException : boolean = false) : boolean;
+    property ConnectTimeout : integer read FConnectTimeout write FConnectTimeout;
   end;
 
   function MemcacheConfigFormat(Load : integer; IP : string; Port : integer = 11211) : string;
@@ -248,12 +255,15 @@ end;
 
 function MemCacheTime(dt : TDateTime) : string;
 var
-  i : UInt64;
+  i : integer;
 begin
   if dt <> 0 then
   begin
-    i := SecondsBetween(EncodeDate(1970,1,1),dt);
-    Result := UIntToStr(i);
+    i := SecondsBetween(Now,dt);
+    if  i >= 60*60*24*30 then
+      Result := IntToStr(DateTimeToUnix(dt))
+    else
+      Result := IntToStr(i);
   end else
     Result := '0';
 end;
@@ -295,8 +305,9 @@ var
   i: Integer;
 begin
   inherited Create;
+  FConnectTimeout := 2000;
   FRegisterPosition := 0;
-  SetLength(ServerRing,100);
+  SetLength(ServerRing,0);
   SetLength(ServerList,0);
   if (ConfigData <> nil) and (ConfigData.Count > 0) then
   begin
@@ -342,28 +353,28 @@ function TMemCache.ExecuteCommand(key, cmd: string): string;
 var
   tcp : TIdTCPClient;
   server : TServerRingItem;
-  s, s13, sFirstFound : string;
+  aryFailed : array of TServerRingItem;
+  s, s13 : string;
   bIncDec : boolean;
 begin
   s := Copy(cmd,1,4);
   bIncDec := (s = 'incr') or (s = 'decr');
   // TODO: Refactor to move to a connected object pool for each server and utilize the preconnected objects.
   //       Will make for a rather large performance boost.
+  setLength(aryFailed,0);
   tcp := TIdTCPClient.Create;
   try
-    sFirstFound := '';
+    tcp.ConnectTimeout := FConnectTimeout;
     repeat
-      server := LocateServer(key);
+      server := LocateServer(key, aryFailed);
       tcp.Host := server.IP;
       tcp.Port := server.Port;
       try
         tcp.Connect;
       except
-        if server.IP = sFirstFound then
-          raise EMemCacheException.Create('None of the registered MemCached servers are responding.');
+        setLength(aryFailed,Length(aryFailed)+1);
+        aryFailed[length(aryFailed)-1] := server;
       end;
-      if sFirstFound = '' then
-        sFirstFound := server.IP;
     until tcp.Connected;
 
     tcp.Socket.Write(cmd+#13#10);
@@ -439,30 +450,65 @@ begin
     raise EMemCacheException.Create('Error storing value: '+s);
 end;
 
-function TMemCache.LocateServer(key : string): TServerRingItem;
+function TMemCache.LocateServer(key : string; Failures : array of TServerRingItem): TServerRingItem;
 begin
-  Result := LocateServer(ToHash(key));
+  Result := LocateServer(ToHash(key), Failures);
 end;
 
-function TMemCache.LocateServer(RingPosition : Int64): TServerRingItem;
+function TMemCache.LocateServer(RingPosition : Int64; Failures : array of TServerRingItem): TServerRingItem;
+  function IsOK(si : TServerRingItem) : boolean;
+  var
+    i: Integer;
+  begin
+    Result := True;
+    for i := low(Failures) to high(Failures) do
+      if (Failures[i].IP = si.IP) and (Failures[i].Port = si.Port) then
+      begin
+        Result := False;
+        break;
+      end;
+  end;
 var
-  i, iFound : integer;
+  i, j, iFound : integer;
 begin
   iFound := -1;
   for i := Low(ServerRing) to High(ServerRing) do
   begin
-    if ServerRing[i].Pos > RingPosition then
+    if (ServerRing[i].Pos > RingPosition) then
     begin
-      if i =low(ServerRing) then
-        iFound := High(ServerRing)
-      else
-        iFound := i;
-      break;
+      if IsOk(ServerRing[i]) then
+      begin
+        if i = low(ServerRing) then
+          iFound := High(ServerRing)
+        else
+          iFound := i;
+        break;
+      end else
+      begin
+        for j := i+1 to High(ServerRing) do
+        begin
+          if IsOk(ServerRing[j]) then
+          begin
+            iFound := j;
+            break;
+          end;
+        end;
+        for j := Low(ServerRing) to i-1 do
+        begin
+          if IsOk(ServerRing[j]) then
+          begin
+            iFound := j;
+            break;
+          end;
+        end;
+        break;
+      end;
     end;
   end;
   if iFound < 0 then
-    iFound := 0;
-
+  begin
+    raise EMemCacheException.Create('None of the registered Memcached servers are responding.');
+  end;
   Result := ServerRing[iFound];
 end;
 
@@ -549,6 +595,7 @@ begin
       ServerList[length(ServerList)-1].IP := str;
   end;
 
+  SetLength(ServerRing,Length(ServerRing)+ServerList[length(ServerList)-1].Load);
   for i := 1 to ServerList[length(ServerList)-1].Load do
   begin
     ServerRing[FRegisterPosition].IP := ServerList[length(ServerList)-1].IP;
@@ -678,6 +725,7 @@ begin
       tcp.Port := ServerList[i].Port;
       try
         tcp.Connect;
+        tcp.Disconnect;
       except
         on e: exception do
         begin
