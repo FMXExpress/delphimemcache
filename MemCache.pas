@@ -2,7 +2,7 @@
 //
 // MemCache.pas - Delphi client for Memcached
 //
-// Delphi Client Version 0.0.2
+// Delphi Client Version 0.2.0
 // Supporting Memcached Version 1.2.6
 //
 // Project Homepage:
@@ -10,7 +10,7 @@
 //
 // Memcached can be found at:
 //    http://code.google.com/p/memcached
-//    http://danga.com/memcached
+//    http://memcached.org/
 //
 // Protocol description:
 //    http://code.sixapart.com/svn/memcached/trunk/server/doc/protocol.txt
@@ -45,9 +45,20 @@
 //    SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 //
 //  Changelog -
+//    4/21/2010 - Added connection pooling for persistent memcached connections. Reduced
+//                value setting / getting latency from 130ms to 1-2ms on a local
+//                memcached server.  You can specify the size of each connection
+//                pool in the create of the TMemCache instance.  It defaults to 10
+//                connections per server in the server ring.  There is now a dependency
+//                on pooling.pas which implements object pooling and is used to
+//                handle the connection pools.  File will be included in project with
+//                with permission of author... me.
+//    1/15/2010 - Fixed AV bugs introduced in FiloverCheckRate introduced yesterday.
+//    1/14/2010 - Improved performance during failover by assuming that if a server went down,
+//                it will continue to be down for FailoverCheckRate seconds.
 //    1/14/2010 - Fixed bug in failover code when a server stops responding.
 //                Impelemented a minor performance improvement by reducing waste in ServerRing
-//                Added a connect timeout property to speed failover response. - defaulted the
+//                Added a ConnectTimeout property to speed failover response. - defaulted the
 //                value to 2s as it is assumed that the cache servers will be on a local
 //                network and connections should be established quickly.
 //    9/30/2009 - Initial release
@@ -113,31 +124,49 @@
 //           on a value in the memcache.  There must be a value alraedy stored for the
 //           specified key
 //
-//  TODO:
-//    - Refactor to move to a connected object pool for each server and utilize
-//      the preconnected objects. Should make for a rather large performance boost.
-//
 ////////////////////////////////////////////////////////////////////////////////////
 
 unit MemCache;
 
 interface
 
-uses SysUtils, Classes, IdTCPClient, IdHashSHA1;
+uses SysUtils, Classes, IdTCPClient, IdHashSHA1, IdGlobal, SyncObjs, MemCachePooling,
+  IdException;
 
 type
   EMemCacheException = class(Exception);
 
-  TMemCacheServer = record
+  TConnectionPool = class(TObjectPool)
+  public
+    function Acquire : TIdTCPClient; reintroduce;
+    procedure Release(item : TIdTCPClient); reintroduce;
+  end;
+
+  TMemCacheServer = class(TObject)
+  private
+    function GetFailure : TDateTime;
+    procedure SetFailure(value : TDateTime);
+  public
+    mrews : TMREWSync;
     Load : integer;
     IP : string;
     Port : integer;
+    ConnectTimeout : integer;
+    FFailure : TDateTime;
+    FConnections : TConnectionPool;
+    constructor Create; reintroduce; virtual;
+    destructor Destroy; override;
+    procedure CreateConnection(Sender : TObject; var AObject : TObject);
+    procedure DestroyConnection(Sender : TObject; var AObject : TObject);
+    property Failure : TDateTime read GetFailure write SetFailure;
+    property Connections : TConnectionPool read FConnections;
   end;
 
   TServerRingItem = record
     IP : string;
     Port : Integer;
     Pos : UInt64;
+    Server : TMemCacheServer;
   end;
 
   IMemCacheValue = interface(IUnknown)
@@ -188,15 +217,23 @@ type
     function SafeToken : UInt64;
   end;
 
+  TMemCacheLogEvent = procedure(Sender : TObject; Server : TMemCacheServer; Log : string) of object;
+
   TMemCache = class(TInterfacedObject, IMemCache)
   private
     ServerList : array of TMemCacheServer;
     ServerRing : array of TServerRingItem;
     FRegisterPosition : integer;
     FConnectTimeout: integer;
+    FFailureCheckRate: integer;
+    FPoolSize: Integer;
+    FOnLogCommand: TMemCacheLogEvent;
+    FOnLogResponse: TMemCacheLogEvent;
+    //FHashCache : TStringList; Considered using a hashcache, but didn't see noticable improvement from rehashing every time.
   protected
     function ToHash(str : string) : UInt64; virtual;
     function ExecuteCommand(key, cmd : string) : string; virtual;
+    //function ExecuteCommand2(key, cmd : string) : string; virtual;
     function LocateServer(key : string; Failures : array of TServerRingItem) : TServerRingItem; overload; virtual;
     function LocateServer(RingPosition : Int64; Failures : array of TServerRingItem): TServerRingItem; overload; virtual;
     procedure RegisterServer(str : string); virtual;
@@ -209,7 +246,7 @@ type
     //
     // If ConfigData is omitted, 100=127.0.0.1:11211 is assumed.
     //
-    constructor Create(ConfigData : TStrings = nil); virtual;
+    constructor Create(ConfigData : TStrings = nil; PoolSize : integer = 10); virtual;
     destructor Destroy; override;
 
     procedure Store(Key, Value : string; Expires : TDateTime = 0; Flags : Word = 0); overload;
@@ -230,7 +267,10 @@ type
     function Decrement(Key : string; ByValue : integer = 1) : UInt64;
 
     function CheckServers(RaiseException : boolean = false) : boolean;
-    property ConnectTimeout : integer read FConnectTimeout write FConnectTimeout;
+    property ConnectTimeout : integer read FConnectTimeout write FConnectTimeout; // in milliseconds
+    property FailureCheckRate : integer read FFailureCheckRate write FFailureCheckRate; // in seconds
+    property OnLogCommand : TMemCacheLogEvent read FOnLogCommand write FOnLogCommand;
+    property OnLogResponse : TMemCacheLogEvent read FOnLogResponse write FOnLogResponse;
   end;
 
   function MemcacheConfigFormat(Load : integer; IP : string; Port : integer = 11211) : string;
@@ -300,13 +340,19 @@ begin
     raise EMemCacheException.Create('Error storing value: '+s);
 end;
 
-constructor TMemCache.Create(ConfigData: TStrings);
+constructor TMemCache.Create(ConfigData: TStrings = nil; PoolSize : integer = 10);
 var
   i: Integer;
 begin
   inherited Create;
-  FConnectTimeout := 2000;
+  FConnectTimeout := 4000;
+  FPoolSize := PoolSize;
   FRegisterPosition := 0;
+  FFailureCheckRate := 30;
+  //FHashCache := TStringList.Create;
+  //FHashCache.CaseSensitive := True;
+  //FHashCache.Sorted := True;
+
   SetLength(ServerRing,0);
   SetLength(ServerList,0);
   if (ConfigData <> nil) and (ConfigData.Count > 0) then
@@ -345,43 +391,262 @@ begin
   for i := low(ServerRing) to High(ServerRing) do
     ServerRing[i].IP := '';
   for i := low(ServerList) to High(ServerList) do
-    ServerList[i].IP := '';
+  begin
+    ServerList[i].Free;
+  end;
+  //FHashCache.Free;
   inherited;
 end;
+
+(*function TMemCache.ExecuteCommand2(key, cmd: string): string;
+var
+  tcp : TIdTCPClient;
+  ri : TServerRingItem;
+  aryFailed : array of TServerRingItem;
+  s, s13, sProfile : string;
+  bIncDec : boolean;
+begin
+  sProfile := 'TMemCache.ExecuteCommand';
+  Profiler.StartStat(sProfile);
+  try
+    if (cmd <> '') and (cmd[length(cmd)-1]<>#13) then
+      cmd := cmd+#13#10;
+    s := Copy(cmd,1,4);
+    bIncDec := (s = 'incr') or (s = 'decr');
+
+    setLength(aryFailed,0);
+
+    Profiler.StartStat(sProfile+'-locateServer');
+    try
+      ri := LocateServer(key, aryFailed);
+    finally
+      Profiler.EndStat(sProfile+'-locateServer');
+    end;
+    if Assigned(FOnLogCommand) then
+      FOnLogCommand(Self, ri.Server, cmd);
+
+    Profiler.StartStat(sProfile+'-TCP');
+    try
+      tcp := ri.Server.Connections.Acquire;
+      try
+        Profiler.StartStat(sProfile+'-TCP-write');
+        try
+          try
+            Profiler.StartStat(sProfile+'-TCP-write-write');
+            try
+              tcp.SendString(cmd);
+            finally
+              Profiler.EndStat(sProfile+'-TCP-write-write');
+            end;
+          except
+            on e: Exception do
+            begin
+              try
+                Profiler.StartStat(sProfile+'-TCP-write-reconnect');
+                try
+                  tcp.CloseSocket;
+                  tcp.Connect(ri.Server.IP, IntToStr(ri.Server.Port));
+                finally
+                  Profiler.StartStat(sProfile+'-TCP-write-reconnect');
+                end;
+                ri.Server.Failure := 0;
+              except
+                ri.Server.Failure := Now;
+                setLength(aryFailed,Length(aryFailed)+1);
+                aryFailed[length(aryFailed)-1] := ri;
+
+                ri.Server.Connections.Release(tcp);
+                Profiler.StartStat(sProfile+'-TCP-write-locateServer');
+                try
+                  ri := LocateServer(key, aryFailed);
+                finally
+                  Profiler.EndStat(sProfile+'-TCP-write-locateServer');
+                end;
+                tcp := ri.Server.Connections.Acquire;
+              end;
+              raise;
+            end
+            else raise;
+          end;
+        finally
+          Profiler.EndStat(sProfile+'-TCP-write');
+        end;
+        result := '';
+        s := '';
+        Profiler.StartStat(sProfile+'-TCP-read');
+        try
+          repeat
+            Profiler.StartStat(sProfile+'-TCP-read-loop');
+            try
+              try
+                Profiler.StartStat(sProfile+'-TCP-read-loop-readln');
+                try
+                  s := tcp.RecvString(4000);
+                finally
+                  Profiler.EndStat(sProfile+'-TCP-read-loop-readln');
+                end;
+              except
+                on e: Exception do
+                begin
+                  try
+                    Profiler.StartStat(sProfile+'-TCP-read-loop-reconnect');
+                    try
+                      tcp.CloseSocket;
+                      tcp.Connect(ri.Server.IP, IntToStr(ri.Server.Port));
+                    finally
+                      Profiler.EndStat(sProfile+'-TCP-read-loop-reconnect');
+                    end;
+                    ri.Server.Failure := 0;
+                  except
+                    ri.Server.Failure := Now;
+                    setLength(aryFailed,Length(aryFailed)+1);
+                    aryFailed[length(aryFailed)-1] := ri;
+
+                    ri.Server.Connections.Release(tcp);
+                    Profiler.StartStat(sProfile+'-TCP-read-loop-locateServer');
+                    try
+                      ri := LocateServer(key, aryFailed);
+                    finally
+                      Profiler.EndStat(sProfile+'-TCP-read-loop-locateServer');
+                    end;
+                    tcp := ri.Server.Connections.Acquire;
+                  end;
+                  raise;
+                end
+                else raise;
+              end;
+
+              Profiler.StartStat(sProfile+'-TCP-read-loop-after-readln');
+              try
+                if Assigned(FOnLogResponse) then
+                  FOnLogResponse(Self, ri.Server, s);
+                s13 := Copy(s,1,13);
+                if result <> '' then
+                  Result := Result+#13#10+s
+                else
+                  Result := s;
+              finally
+                Profiler.EndStat(sProfile+'-TCP-read-loop-after-readln');
+              end;
+            finally
+              Profiler.EndStat(sProfile+'-TCP-read-loop');
+            end;
+          until bIncDec or
+                (s = 'END') or
+                (s = 'DELETED') or
+                (s = 'STORED') or
+                (s = 'ERROR') or
+                (s13 = 'SERVER_ERROR') or
+                (s13 = 'CLIENT_ERROR');
+        finally
+          Profiler.EndStat(sProfile+'-TCP-read');
+        end;
+      finally
+        ri.Server.Connections.Release(tcp);
+      end;
+    finally
+      Profiler.EndStat(sProfile+'-TCP');
+    end;
+
+    if TrimRight(Result) <> 'ERROR' then
+    begin
+      s := Copy(Result,1,13);
+      if s = 'CLIENT_ERROR ' then
+        raise EMemCacheException.Create('Memcache Error: Input does not conform to protocol - '+Copy(Result,14,high(Integer)))
+      else if s = 'SERVER_ERROR ' then
+        raise EMemCacheException.Create('Memcache Error: Server raised exception - '+Copy(Result,14,High(Integer)));
+    end else
+      raise EMemCacheException.Create('Memcache Error: Non Existent Command: '+cmd)
+  finally
+    Profiler.EndStat(sProfile);
+  end;
+end;
+*)
 
 function TMemCache.ExecuteCommand(key, cmd: string): string;
 var
   tcp : TIdTCPClient;
-  server : TServerRingItem;
+  ri : TServerRingItem;
   aryFailed : array of TServerRingItem;
-  s, s13 : string;
+  s, s13, sProfile : string;
   bIncDec : boolean;
 begin
+  sProfile := 'TMemCache.ExecuteCommand';
+  if (cmd <> '') and (cmd[length(cmd)-1]<>#13) then
+    cmd := cmd+#13#10;
   s := Copy(cmd,1,4);
   bIncDec := (s = 'incr') or (s = 'decr');
-  // TODO: Refactor to move to a connected object pool for each server and utilize the preconnected objects.
-  //       Will make for a rather large performance boost.
-  setLength(aryFailed,0);
-  tcp := TIdTCPClient.Create;
-  try
-    tcp.ConnectTimeout := FConnectTimeout;
-    repeat
-      server := LocateServer(key, aryFailed);
-      tcp.Host := server.IP;
-      tcp.Port := server.Port;
-      try
-        tcp.Connect;
-      except
-        setLength(aryFailed,Length(aryFailed)+1);
-        aryFailed[length(aryFailed)-1] := server;
-      end;
-    until tcp.Connected;
 
-    tcp.Socket.Write(cmd+#13#10);
+  setLength(aryFailed,0);
+
+  ri := LocateServer(key, aryFailed);
+  if Assigned(FOnLogCommand) then
+    FOnLogCommand(Self, ri.Server, cmd);
+
+  tcp := ri.Server.Connections.Acquire;
+  try
+    try
+      if not tcp.Connected then
+      begin
+        tcp.Connect;
+        ri.Server.Failure := 0;
+      end;
+      tcp.Socket.Write(cmd);
+    except
+      on e: Exception do
+      begin
+        try
+          if Assigned(tcp.IOHandler) then
+            tcp.IOHandler.Close;
+          tcp.Connect;
+          ri.Server.Failure := 0;
+        except
+          ri.Server.Failure := Now;
+          setLength(aryFailed,Length(aryFailed)+1);
+          aryFailed[length(aryFailed)-1] := ri;
+
+          ri.Server.Connections.Release(tcp);
+          ri := LocateServer(key, aryFailed);
+          tcp := ri.Server.Connections.Acquire;
+        end;
+        raise;
+      end
+      else raise;
+    end;
     result := '';
     s := '';
     repeat
-      s := tcp.Socket.ReadLn;
+      try
+        if not tcp.Connected then
+        begin
+          tcp.Connect;
+          ri.Server.Failure := 0;
+        end;
+        s := tcp.Socket.ReadLn(#13#10);
+      except
+        on e: Exception do
+        begin
+          try
+            if Assigned(tcp.IOHandler) then
+              tcp.IOHandler.Close;
+            tcp.Connect;
+            ri.Server.Failure := 0;
+          except
+            ri.Server.Failure := Now;
+            setLength(aryFailed,Length(aryFailed)+1);
+            aryFailed[length(aryFailed)-1] := ri;
+
+            ri.Server.Connections.Release(tcp);
+            ri := LocateServer(key, aryFailed);
+            tcp := ri.Server.Connections.Acquire;
+          end;
+          raise;
+        end
+        else raise;
+      end;
+
+      if Assigned(FOnLogResponse) then
+        FOnLogResponse(Self, ri.Server, s);
       s13 := Copy(s,1,13);
       if result <> '' then
         Result := Result+#13#10+s
@@ -396,10 +661,10 @@ begin
           (s13 = 'SERVER_ERROR') or
           (s13 = 'CLIENT_ERROR');
   finally
-    tcp.Free;
+    ri.Server.Connections.Release(tcp);
   end;
 
-  if Result <> 'ERROR'#13#10 then
+  if TrimRight(Result) <> 'ERROR' then
   begin
     s := Copy(Result,1,13);
     if s = 'CLIENT_ERROR ' then
@@ -407,7 +672,7 @@ begin
     else if s = 'SERVER_ERROR ' then
       raise EMemCacheException.Create('Memcache Error: Server raised exception - '+Copy(Result,14,High(Integer)));
   end else
-    raise EMemCacheException.Create('Memcache Error: Non Existent Command')
+    raise EMemCacheException.Create('Memcache Error: Non Existent Command: '+cmd)
 end;
 
 function TMemCache.Increment(Key: string; ByValue : integer = 1): UInt64;
@@ -461,12 +726,18 @@ function TMemCache.LocateServer(RingPosition : Int64; Failures : array of TServe
     i: Integer;
   begin
     Result := True;
-    for i := low(Failures) to high(Failures) do
-      if (Failures[i].IP = si.IP) and (Failures[i].Port = si.Port) then
-      begin
-        Result := False;
-        break;
-      end;
+    if (si.Server.Failure > 0) and (SecondsBetween(si.Server.Failure,Now) < FFailureCheckRate) then
+      Result := False;
+
+    if Result then
+    begin
+      for i := low(Failures) to high(Failures) do
+        if (Failures[i].IP = si.IP) and (Failures[i].Port = si.Port) then
+        begin
+          Result := False;
+          break;
+        end;
+    end;
   end;
 var
   i, j, iFound : integer;
@@ -503,7 +774,15 @@ begin
         end;
         break;
       end;
+    end else if i=High(ServerRing) then
+    begin
+      if IsOk(ServerRing[low(ServerRing)]) then
+      begin
+        iFound := Low(ServerRing);
+        break;
+      end;
     end;
+
   end;
   if iFound < 0 then
   begin
@@ -570,37 +849,49 @@ end;
 procedure TMemCache.RegisterServer(str: string);
 var
   i, iPos : integer;
+  mcs : TMemCacheServer;
 begin
-  SetLength(ServerList,length(ServerList)+1);
-  ServerList[length(ServerList)-1].Load := 100;
-  ServerList[length(ServerList)-1].Port := 11211;
-  ServerList[length(ServerList)-1].IP := '127.0.0.1';
+  mcs := TMemCacheServer.Create;
+  try
+    mcs.Load := 1;
+    mcs.Port := 11211;
+    mcs.IP := '127.0.0.1';
+    mcs.Failure := 0;
+    mcs.ConnectTimeout := Self.ConnectTimeout;
 
-  if str <> '' then
-  begin
-    iPos := Pos('=',str);
-    if iPos > 0 then
+    if str <> '' then
     begin
-      ServerList[length(ServerList)-1].Load := StrToInt(Copy(str,1,iPos-1));
-      System.Delete(str,1,iPos);
+      iPos := Pos('=',str);
+      if iPos > 0 then
+      begin
+        mcs.Load := StrToInt(Copy(str,1,iPos-1));
+        System.Delete(str,1,iPos);
+      end;
+
+      iPos := Pos(':',str);
+      if iPos > 0 then
+      begin
+        mcs.IP := Copy(str,1,iPos-1);
+        System.Delete(str,1,iPos);
+        mcs.Port := StrToInt(str);
+      end else
+        mcs.IP := str;
     end;
-
-    iPos := Pos(':',str);
-    if iPos > 0 then
-    begin
-      ServerList[length(ServerList)-1].IP := Copy(str,1,iPos-1);
-      System.Delete(str,1,iPos);
-      ServerList[length(ServerList)-1].Port := StrToInt(str);
-    end else
-      ServerList[length(ServerList)-1].IP := str;
+    mcs.Connections.PoolSize := FPoolSize;
+    mcs.Connections.Start(true);
+    SetLength(ServerList,length(ServerList)+1);
+    ServerList[length(ServerList)-1] := mcs;
+  except
+    mcs.Free;
+    raise;
   end;
-
-  SetLength(ServerRing,Length(ServerRing)+ServerList[length(ServerList)-1].Load);
-  for i := 1 to ServerList[length(ServerList)-1].Load do
+  SetLength(ServerRing,Length(ServerRing)+mcs.Load);
+  for i := 1 to mcs.Load do
   begin
-    ServerRing[FRegisterPosition].IP := ServerList[length(ServerList)-1].IP;
-    ServerRing[FRegisterPosition].Port := ServerList[length(ServerList)-1].Port;
-    ServerRing[FRegisterPosition].Pos := ToHash(ServerList[length(ServerList)-1].IP+'.'+IntToStr(ServerList[length(ServerList)-1].Port)+'.'+IntToStr(i));
+    ServerRing[FRegisterPosition].IP := mcs.IP;
+    ServerRing[FRegisterPosition].Port := mcs.Port;
+    ServerRing[FRegisterPosition].Pos := ToHash(mcs.IP+'.'+IntToStr(mcs.Port)+'.'+IntToStr(i));
+    ServerRing[FRegisterPosition].Server := mcs;
     inc(FRegisterPosition);
   end;
 end;
@@ -760,13 +1051,20 @@ function TMemCache.ToHash(str: string): UInt64;
   end;
 var
   hash : TIdHashSHA1;
+  idx : integer;
 begin
-  hash := TIdHashSHA1.Create;
-  try
-    Result := HexToInt64(Copy(hash.HashStringAsHex(str),1,8));
-  finally
-    hash.Free;
-  end;
+  {idx := FHashCache.IndexOfName(str);
+  if idx < 0 then
+  begin }
+    hash := TIdHashSHA1.Create;
+    try
+      Result := HexToInt64(Copy(hash.HashStringAsHex(str),1,8));
+      //FHashCache.Add(str+'='+IntToStr(Result));
+    finally
+      hash.Free;
+    end;
+  {end else
+    Result := StrToInt64(FHashCache.ValueFromIndex[idx]); }
 end;
 
 { TMemCacheValue }
@@ -846,7 +1144,7 @@ end;
 
 function TMemCacheValue.Key: string;
 begin
-
+  Result := FKey;
 end;
 
 function TMemCacheValue.SafeToken: UInt64;
@@ -862,6 +1160,84 @@ end;
 function TMemCacheValue.Value: string;
 begin
   Result := FStream.DataString;
+end;
+
+{ TMemCacheServer }
+
+constructor TMemCacheServer.Create;
+begin
+  inherited Create;
+  mrews := TMREWSync.Create;
+  FConnections := TConnectionPool.Create;
+  FConnections.OnCreateObject := Self.CreateConnection;
+  FConnections.OnDestroyObject := Self.DestroyConnection;
+end;
+
+procedure TMemCacheServer.CreateConnection(Sender: TObject;
+  var AObject: TObject);
+var tcp : TIdTCPClient;
+begin
+  tcp := TIdTCPClient.Create;
+  tcp.ConnectTimeout := Self.ConnectTimeout;
+  tcp.ReadTimeout := Self.ConnectTimeout;
+  tcp.Host := self.IP;
+  tcp.Port := self.Port;
+  tcp.ReuseSocket := rsTrue;
+  try
+    tcp.Connect;
+  except
+    tcp.Free;
+    raise;
+  end;
+  AObject := tcp;
+end;
+
+destructor TMemCacheServer.Destroy;
+begin
+  mrews.Free;
+  FConnections.Free;
+  inherited;
+end;
+
+procedure TMemCacheServer.DestroyConnection(Sender: TObject;
+  var AObject: TObject);
+begin
+  FreeAndNil(AObject);
+end;
+
+function TMemCacheServer.GetFailure: TDateTime;
+begin
+  mrews.BeginRead;
+  try
+    Result := FFailure;
+  finally
+    mrews.EndRead;
+  end;
+end;
+
+procedure TMemCacheServer.SetFailure(value: TDateTime);
+begin
+  if Failure <> value then
+  begin
+    mrews.BeginWrite;
+    try
+      FFailure := value;
+    finally
+      mrews.EndWrite;
+    end;
+  end;
+end;
+
+{ TConnectionPool }
+
+function TConnectionPool.Acquire: TIdTCPClient;
+begin
+  result := TIdTCPClient(inherited Acquire);
+end;
+
+procedure TConnectionPool.Release(item: TIdTCPClient);
+begin
+  inherited Release(item);
 end;
 
 end.
