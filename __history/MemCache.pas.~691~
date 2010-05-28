@@ -421,7 +421,27 @@ begin
   if Assigned(FOnLogCommand) then
     FOnLogCommand(Self, ri.Server, cmd);
 
-  tcp := ri.Server.Connections.Acquire;
+  try
+    tcp := ri.Server.Connections.Acquire;
+  except
+    if not ri.Server.Connections.Active then
+    begin
+      FPoolActiveCS.Acquire;
+      try
+        if not ri.Server.Connections.Active then
+        begin
+          try
+            ri.Server.Connections.Start(false)
+          except
+            // do nothing
+          end;
+        end;
+      finally
+        FPoolActiveCS.Release;
+      end;
+    end;
+
+  end;
   try
     try
       if not tcp.Connected then
@@ -564,8 +584,7 @@ function TMemCache.LocateServer(RingPosition : Int64; Failures : array of TServe
     i: Integer;
   begin
     Result := True;
-    if (not si.Server.Connections.Active) or
-       ((si.Server.Failure > 0) and (SecondsBetween(si.Server.Failure,Now) < FFailureCheckRate)) then
+    if (si.Server.Failure > 0) and (SecondsBetween(si.Server.Failure,Now) < FFailureCheckRate) then
       Result := False;
 
     if Result then
@@ -576,25 +595,6 @@ function TMemCache.LocateServer(RingPosition : Int64; Failures : array of TServe
           Result := False;
           break;
         end;
-    end else
-    begin
-      if (not si.Server.Connections.Active) then
-      begin
-        FPoolActiveCS.Enter;
-        try
-          if (not si.Server.Connections.Active) and (SecondsBetween(si.Server.Failure,Now) >= FFailureCheckRate) then
-          begin
-            try
-              si.Server.Connections.Start;
-              Result := True;
-            except
-              // Mask Error -- maybe create an event to log this.
-            end;
-          end;
-        finally
-          FPoolActiveCS.Leave;
-        end;
-      end;
     end;
   end;
 var

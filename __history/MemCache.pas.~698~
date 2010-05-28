@@ -578,21 +578,13 @@ function TMemCache.LocateServer(RingPosition : Int64; Failures : array of TServe
         end;
     end else
     begin
-      if (not si.Server.Connections.Active) then
+      if (not si.Server.Connections.Active) and (SecondsBetween(si.Server.Failure,Now) >= FFailureCheckRate) then
       begin
-        FPoolActiveCS.Enter;
         try
-          if (not si.Server.Connections.Active) and (SecondsBetween(si.Server.Failure,Now) >= FFailureCheckRate) then
-          begin
-            try
-              si.Server.Connections.Start;
-              Result := True;
-            except
-              // Mask Error -- maybe create an event to log this.
-            end;
-          end;
-        finally
-          FPoolActiveCS.Leave;
+          si.Server.Connections.Start;
+          Result := True;
+        except
+          // Mask Error -- maybe create an event to log this.
         end;
       end;
     end;

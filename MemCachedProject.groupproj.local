@@ -1,0 +1,9 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<BorlandProject>
+  <Transactions>
+    <Transaction>2009/09/30 14:44:46.656.groupproj,C:\Users\jsouthwell\Documents\RAD Studio\Projects\ProjectGroup1.groupproj=Z:\Common\memcache\MemCachedProject.groupproj</Transaction>
+  </Transactions>
+  <Default.Personality>
+    <Projects ActiveProject="MemCacheTest.exe"/>
+  </Default.Personality>
+</BorlandProject>

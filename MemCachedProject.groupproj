@@ -1,0 +1,36 @@
+﻿	<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+		<PropertyGroup>
+			<ProjectGuid>{ED393400-B7C6-499B-819B-0B4E6A76CD5C}</ProjectGuid>
+		</PropertyGroup>
+		<ItemGroup>
+			<Projects Include="test\MemCacheTest.dproj">
+				<Dependencies/>
+			</Projects>
+		</ItemGroup>
+		<ProjectExtensions>
+			<Borland.Personality>Default.Personality.12</Borland.Personality>
+			<Borland.ProjectType/>
+			<BorlandProject>
+				<Default.Personality/>
+			</BorlandProject>
+		</ProjectExtensions>
+		<Target Name="MemCacheTest">
+			<MSBuild Projects="test\MemCacheTest.dproj"/>
+		</Target>
+		<Target Name="MemCacheTest:Clean">
+			<MSBuild Targets="Clean" Projects="test\MemCacheTest.dproj"/>
+		</Target>
+		<Target Name="MemCacheTest:Make">
+			<MSBuild Targets="Make" Projects="test\MemCacheTest.dproj"/>
+		</Target>
+		<Target Name="Build">
+			<CallTarget Targets="MemCacheTest"/>
+		</Target>
+		<Target Name="Clean">
+			<CallTarget Targets="MemCacheTest:Clean"/>
+		</Target>
+		<Target Name="Make">
+			<CallTarget Targets="MemCacheTest:Make"/>
+		</Target>
+		<Import Project="$(BDS)\Bin\CodeGear.Group.Targets" Condition="Exists('$(BDS)\Bin\CodeGear.Group.Targets')"/>
+	</Project>

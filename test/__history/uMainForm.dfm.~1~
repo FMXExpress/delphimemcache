@@ -23,8 +23,14 @@ object frmMemCacheTest: TfrmMemCacheTest
     ActivePage = tsFunctions
     Align = alClient
     TabOrder = 0
+    ExplicitLeft = 312
+    ExplicitTop = 64
+    ExplicitWidth = 289
+    ExplicitHeight = 193
     object tsServers: TTabSheet
       Caption = 'Servers'
+      ExplicitWidth = 281
+      ExplicitHeight = 165
       DesignSize = (
         264
         216)
@@ -58,6 +64,10 @@ object frmMemCacheTest: TfrmMemCacheTest
     object tsFunctions: TTabSheet
       Caption = 'Functions'
       ImageIndex = 1
+      ExplicitLeft = -524
+      ExplicitTop = 272
+      ExplicitWidth = 281
+      ExplicitHeight = 165
       object Label1: TLabel
         Left = 8
         Top = 8
