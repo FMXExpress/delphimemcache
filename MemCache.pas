@@ -2,7 +2,7 @@
 //
 // MemCache.pas - Delphi client for Memcached
 //
-// Delphi Client Version 0.2.0
+// Delphi Client Version 0.2.1
 // Supporting Memcached Version 1.2.6
 //
 // Project Homepage:
@@ -45,6 +45,9 @@
 //    SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 //
 //  Changelog -
+//    7/19/2010 - Added a FailoverType property to permit overriding the way failover
+//                is handled. Currently just enables and disables, but could extend to
+//                differing algorithms in the future.
 //    4/21/2010 - Added connection pooling for persistent memcached connections. Reduced
 //                value setting / getting latency from 130ms to 1-2ms on a local
 //                memcached server.  You can specify the size of each connection
@@ -135,6 +138,7 @@ uses SysUtils, Classes, IdTCPClient, IdHashSHA1, IdGlobal, SyncObjs, MemCachePoo
 
 type
   EMemCacheException = class(Exception);
+  EMemCacheServerDown = class(EMemCacheException);
 
   TConnectionPool = class(TObjectPool)
   public
@@ -219,6 +223,8 @@ type
 
   TMemCacheLogEvent = procedure(Sender : TObject; Server : TMemCacheServer; Log : string) of object;
 
+  TMemCacheFailoverType = (failNone, failNextAvailable);
+
   TMemCache = class(TInterfacedObject, IMemCache)
   private
     ServerList : array of TMemCacheServer;
@@ -230,6 +236,7 @@ type
     FOnLogCommand: TMemCacheLogEvent;
     FOnLogResponse: TMemCacheLogEvent;
     FPoolActiveCS : TCriticalSection;
+    FFailoverType : TMemCacheFailoverType;
     //FHashCache : TStringList; Considered using a hashcache, but didn't see noticable improvement from rehashing every time.
   protected
     function ToHash(str : string) : UInt64; virtual;
@@ -272,6 +279,7 @@ type
     property FailureCheckRate : integer read FFailureCheckRate write FFailureCheckRate; // in seconds
     property OnLogCommand : TMemCacheLogEvent read FOnLogCommand write FOnLogCommand;
     property OnLogResponse : TMemCacheLogEvent read FOnLogResponse write FOnLogResponse;
+    property FailoverType : TMemCacheFailoverType read FFailoverType write FFailoverType;
   end;
 
   function MemcacheConfigFormat(Load : integer; IP : string; Port : integer = 11211) : string;
@@ -351,6 +359,7 @@ begin
   FPoolSize := PoolSize;
   FRegisterPosition := 0;
   FFailureCheckRate := 30;
+  FFailoverType := failNone;
   //FHashCache := TStringList.Create;
   //FHashCache.CaseSensitive := True;
   //FHashCache.Sorted := True;
@@ -444,8 +453,17 @@ begin
           aryFailed[length(aryFailed)-1] := ri;
 
           ri.Server.Connections.Release(tcp);
-          ri := LocateServer(key, aryFailed);
-          tcp := ri.Server.Connections.Acquire;
+          case FFailoverType of
+            failNone:
+              begin
+                raise EMemCacheServerDown.Create(e.Message);
+              end;
+            failNextAvailable:
+              begin
+                ri := LocateServer(key, aryFailed);
+                tcp := ri.Server.Connections.Acquire;
+              end;
+          end;
         end;
         raise;
       end
@@ -475,8 +493,17 @@ begin
             aryFailed[length(aryFailed)-1] := ri;
 
             ri.Server.Connections.Release(tcp);
-            ri := LocateServer(key, aryFailed);
-            tcp := ri.Server.Connections.Acquire;
+          case FFailoverType of
+            failNone:
+              begin
+                raise EMemCacheServerDown.Create(e.Message);
+              end;
+            failNextAvailable:
+              begin
+                ri := LocateServer(key, aryFailed);
+                tcp := ri.Server.Connections.Acquire;
+              end;
+          end;
           end;
           raise;
         end
@@ -578,22 +605,29 @@ function TMemCache.LocateServer(RingPosition : Int64; Failures : array of TServe
         end;
     end else
     begin
-      if (not si.Server.Connections.Active) then
-      begin
-        FPoolActiveCS.Enter;
-        try
-          if (not si.Server.Connections.Active) and (SecondsBetween(si.Server.Failure,Now) >= FFailureCheckRate) then
+      case FFailoverType of
+        failNone:
+          raise EMemCacheServerDown.Create('Memcache server is currently offline. Retest in '+IntToStr(FFailureCheckRate - SecondsBetween(si.Server.Failure,Now))+' seconds');
+        failNextAvailable:
           begin
-            try
-              si.Server.Connections.Start;
-              Result := True;
-            except
-              // Mask Error -- maybe create an event to log this.
+            if (not si.Server.Connections.Active) then
+            begin
+              FPoolActiveCS.Enter;
+              try
+                if (not si.Server.Connections.Active) and (SecondsBetween(si.Server.Failure,Now) >= FFailureCheckRate) then
+                begin
+                  try
+                    si.Server.Connections.Start;
+                    Result := True;
+                  except
+                    // Mask Error -- maybe create an event to log this.
+                  end;
+                end;
+              finally
+                FPoolActiveCS.Leave;
+              end;
             end;
           end;
-        finally
-          FPoolActiveCS.Leave;
-        end;
       end;
     end;
   end;
